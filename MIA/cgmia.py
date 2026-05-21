@@ -10,7 +10,7 @@ from sklearn.metrics import precision_score, recall_score, f1_score, matthews_co
 from torch.utils.data import Dataset, DataLoader, random_split, Subset
 import pandas as pd
 
-with open("../phi_data.json","r",encoding="utf-8") as f:
+with open("../starcoderbase_3b_lora_phi_data.json","r",encoding="utf-8") as f:
     data_set = json.load(f)
 
 
@@ -56,16 +56,16 @@ result = [
         "perplexity": group["perplexity"],
         "lev": group["lev"],
         "benchmark":group["bench"],
-        "code_vec": np.concatenate(group["code_vec"]),
+        "code_vec": np.array(group["code_vec"]), # shape(5,768)
         "pass": group["pass"],
         "codebleu":group["codebleu"]
     }
     for group in grouped.values()
 ]
 
+
 experts_features=[]
 feature_name = ["lev","pass","codebleu","perplexity"]
-
 for item in result:
     item_features = []
     for feature in feature_name:
@@ -74,140 +74,79 @@ for item in result:
             item_features.append(item_feature)
     experts_features.append(item_features)
 
-code_features = []
-for i in range(len(result)):
-    code_features.append(result[i]["code_vec"])
 
+class CodeEmbeddingCompressor(nn.Module):
+    def __init__(self, input_dim=768, output_dim=768):
+        super().__init__()
+        self.cnn = nn.Sequential(
+            nn.Conv1d(in_channels=input_dim, out_channels=input_dim, kernel_size=3, padding=1),
+            nn.ReLU(),
+            nn.Conv1d(in_channels=input_dim, out_channels=output_dim, kernel_size=3, padding=1),
+            nn.AdaptiveAvgPool1d(1)
+        )
+    def forward(self, x):
+        # 输入: [batch, 5, 768]
+        x = x.transpose(1, 2)       # [batch, 768, 5]
+        x = self.cnn(x)             # [batch, 768, 1]
+        x = x.squeeze(-1)           # [batch, 768]
+        return x
+
+
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+compressor = CodeEmbeddingCompressor().to(device)
+compressor.eval()
+
+# 存放特征
 answer_features = []
-for i in range(len(result)):
-    answer_features.append(result[i]["answer"])
-answer_features = np.array(answer_features)
+compressed_code_features = []
+
+for item in result:
+
+    ans_vec = np.array(item["answer"])
+    answer_features.append(ans_vec)
+
+
+    code_vec_5 = torch.tensor(item["code_vec"],dtype=torch.float32).unsqueeze(0).to(device) # [1,5,768]
+    with torch.no_grad():
+        compressed_vec = compressor(code_vec_5) # [1,768]
+    compressed_code_features.append(compressed_vec.cpu().numpy()[0])
+
+answer_features = np.array(answer_features)             # (N,768)
+compressed_code_features = np.array(compressed_code_features) # (N,768)
+
+
+# Standardization
+scaler = StandardScaler()
+standardized_data = scaler.fit_transform(experts_features)
+experts_features_array = np.array(standardized_data)
+
+# FC层升维固定输出2048维
+input_size = experts_features_array.shape[1]
+output_size = 2048
+fc_layer = nn.Linear(input_size, output_size)
+
+with torch.no_grad():
+    output_features = fc_layer(torch.FloatTensor(experts_features_array))
+expert_2048 = output_features.numpy() # (N,2048)
+
+
+merged_features = np.hstack([answer_features, compressed_code_features, expert_2048])
 
 
 member_classes = []
 for i in range(len(result)):
     member_classes.append(result[i]["class"])
 
-
-class ImprovedModel(nn.Module):
-    def __init__(self, input_dim):
-        super(ImprovedModel, self).__init__()
-        # First convolutional layer: using larger kernel and stride=2 for downsampling
-        self.conv1 = nn.Conv1d(in_channels=1, out_channels=1,
-                              kernel_size=2, stride=2, padding=2)
-        self.bn_conv1 = nn.BatchNorm1d(1)
-
-        # Second convolutional layer: also using stride=2
-        self.conv2 = nn.Conv1d(in_channels=1, out_channels=1,
-                              kernel_size=2, stride=2, padding=1)
-        self.bn_conv2 = nn.BatchNorm1d(1)
-
-        # # Third convolutional layer: further compression (commented out)
-        # self.conv3 = nn.Conv1d(in_channels=1, out_channels=1,
-        #                       kernel_size=3, stride=2, padding=1)
-        # self.bn_conv3 = nn.BatchNorm1d(1)
-
-        # Calculate dimension after convolution
-        conv_output_dim = input_dim // 8  # Three stride=2 compressions
-        conv_output_dim = conv_output_dim * 64
-
-    def forward(self, x):
-        x = x.unsqueeze(1)  # [batch, 1, input_dim]
-
-        # Convolutional part
-        x = F.relu(self.bn_conv1(self.conv1(x)))  # [batch, 16, input_dim/2]
-        x = F.relu(self.bn_conv2(self.conv2(x)))  # [batch, 32, input_dim/4]
-        # x = F.relu(self.bn_conv3(self.conv3(x)))  # [batch, 64, input_dim/8]
-
-        x = x.view(x.size(0), -1)  # Flatten
-        return x
-
-
-# Check GPU availability
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-print(f"Using device: {device}")
-
-# Initialize model and move to GPU
-model = ImprovedModel(input_dim=6 * 768).to(device)
-model.eval()  # Set to evaluation mode
-code_features = np.array(code_features)
-code_features = np.hstack([answer_features,code_features])
-input_tensor = torch.from_numpy(code_features).float().to(device)
-# Use larger batch size to improve GPU utilization
-batch_size = 256  # Adjust based on GPU memory
-dataset = torch.utils.data.TensorDataset(input_tensor)
-loader = torch.utils.data.DataLoader(dataset, batch_size=batch_size)
-
-# Collect all features
-all_features = []
-with torch.no_grad():  # Disable gradient calculation
-    for batch in loader:
-        features = model(batch[0])
-        all_features.append(features.cpu())  # Move back to CPU to save GPU memory
-
-# Combine features from all batches
-conv_features = torch.cat(all_features, dim=0)
-conv_features_np = conv_features.numpy()
-
-experts_features = np.array(experts_features)
-code_features = np.array(code_features)
-
-
-# from transformers import AutoTokenizer
-# tokenizer = AutoTokenizer.from_pretrained("../models/codebert")
-# max_length = 256
-# answer_features=[]
-# # Get semantic features
-# for i in range(len(result)):
-#     encoded_inputs = tokenizer(
-#         result[i]["answer"],
-#         padding="max_length",  # Pad to max_length
-#         max_length=max_length,         # Fixed length
-#         truncation=True,       # Truncate if exceeds max_length
-#         return_tensors="pt",   # Return PyTorch tensors (optional)
-#     )
-#     answer_features.append(encoded_inputs["input_ids"][0].tolist())
-
-# Standardization
-scaler = StandardScaler()
-standardized_data = scaler.fit_transform(experts_features)
-
-experts_features_array = np.array(standardized_data)
-
-# Convert to PyTorch tensor
-features_tensor = torch.FloatTensor(experts_features_array)
-
-# Define the fully connected layer
-input_size = experts_features_array.shape[1]  # Number of input features
-output_size = 2048  # Desired output dimension
-
-fc_layer = nn.Linear(input_size, output_size)
-
-# Pass the features through the layer
-with torch.no_grad():  # We don't need gradients for this forward pass
-    output_features = fc_layer(features_tensor)
-
-# Convert back to numpy array
-output_features_np = output_features.numpy()
-
-
-
-merged_features = np.hstack([conv_features_np, output_features_np])
-
-
 final_data = []
 for i in range(len(merged_features)):
     final_data.append({"feature":merged_features[i],"class":member_classes[i],"model":result[i]["model"],"benchmark":result[i]["benchmark"]})
 
-# Extract all features
-all_features = [item['feature'] for item in final_data]
-all_features = np.array(all_features)
-
 # Fill NaN/Inf with constant 1
 imputer = SimpleImputer(strategy='constant', fill_value=1)
+all_features = [item['feature'] for item in final_data]
+all_features = np.array(all_features)
 all_features_filled = imputer.fit_transform(all_features)
 
-# Write the filled data back to final_data
 for i, item in enumerate(final_data):
     item['feature'] = all_features_filled[i].tolist()
 
@@ -273,7 +212,7 @@ train_dataset, val_dataset, test_dataset = random_split(full_dataset, [train_siz
 for run in range(5):
     print(f"\n=== Starting Run {run+1}/5 ===")
     # Get model parameters
-    input_dim = len(final_data[0]['feature'])
+    input_dim = len(final_data[0]['feature']) # 此时输入维度固定为3584
     hidden_dim = 1024
     output_dim = 2
 
@@ -283,14 +222,14 @@ for run in range(5):
 
     # Initialize model
     model = ImprovedModel(input_dim, hidden_dim, output_dim).to(device)
-    pos_weight = torch.tensor([1.0, 1.0]).to(device)  # [负样本权重, 正样本权重]。此处给正样本3倍权重
+    pos_weight = torch.tensor([1.0, 1.0]).to(device)
     criterion = nn.CrossEntropyLoss()
     optimizer = torch.optim.Adam(model.parameters(), lr=1e-4)
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, 'min', patience=3)
 
     # Training loop
     best_val_loss = float('inf')
-    patience = 5
+    patience = 10
     no_improve = 0
     num_epochs = 50
 
@@ -459,7 +398,7 @@ cols_order = [
 median_results = median_results[cols_order]
 
 # Save as CSV
-output_file = "experts_all/median_experts_6.csv"  # Modify filename to reflect content
+output_file = "experts_all/median_experts_6_starcoder.csv"
 median_results.to_csv(output_file, index=False)
 print(f"\nMedian test results saved to {output_file}")
 
